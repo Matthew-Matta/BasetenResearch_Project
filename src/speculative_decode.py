@@ -1,3 +1,4 @@
+-- Active: 1750880455986@@127.0.0.1@5432
 """
 Hybrid Speculative Decoding Engine
 ===================================
@@ -81,6 +82,15 @@ class DynamicLengthController:
 
     def get_draft_length(self, source: str) -> int:
         return self._draft_len.get(source, 4)
+
+    def get_estimated_rate(self, source: str) -> float:
+        """Return rolling-window acceptance rate for a source. 0.5 if no data yet."""
+        window = self._window.get(source, [])
+        if not window:
+            return 0.5  # neutral prior — assume beneficial until proven otherwise
+        total_p = sum(p for p, _ in window)
+        total_a = sum(a for _, a in window)
+        return total_a / total_p if total_p > 0 else 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -234,12 +244,42 @@ class HybridSpecDecoder:
                 source = "SA"
                 draft_tokens = sa_drafts[:draft_len]
             elif uses_draft and self.draft_model is not None:
-                source = "draft"
-                draft_tokens, draft_token_probs, draft_past_kv, draft_last_logit = (
-                    self._draft_model_tokens_cached(
-                        draft_last_logit, draft_past_kv, draft_len, temperature
+                # Cost-aware routing for hybrid_dynamic:
+                # draft is economical only if expected accepted tokens > 1 (break-even vs AR).
+                # Expected accepted = draft_rate * draft_dl. If <= 1.0, AR fallback is cheaper.
+                if mode == "hybrid_dynamic":
+                    draft_rate = dlc.get_estimated_rate("draft")
+                    draft_beneficial = (draft_rate * draft_dl) > 1.0
+                else:
+                    draft_beneficial = True
+
+                if draft_beneficial:
+                    source = "draft"
+                    draft_tokens, draft_token_probs, draft_past_kv, draft_last_logit = (
+                        self._draft_model_tokens_cached(
+                            draft_last_logit, draft_past_kv, draft_len, temperature
+                        )
                     )
-                )
+                else:
+                    # AR fallback — single target step, no draft overhead
+                    source = "autoregressive"
+                    new_tok = self._sample(target_last_logit, temperature, top_p).item()
+                    tracker.record_draft_attempt("autoregressive", proposed=1, accepted=1, draft_len=1)
+                    if new_tok == eos:
+                        break
+                    generated_ids = torch.cat(
+                        [generated_ids, torch.tensor([[new_tok]], device=self.device)], dim=1
+                    )
+                    dsa.extend(new_tok)
+                    tok_tensor = torch.tensor([[new_tok]], device=self.device)
+                    t_out = self.target_model(tok_tensor, past_key_values=target_past_kv, use_cache=True)
+                    target_past_kv = t_out.past_key_values
+                    target_last_logit = t_out.logits[0, -1, :]
+                    # Keep draft KV in sync so future draft iterations start from the right state
+                    d_out = self.draft_model(tok_tensor, past_key_values=draft_past_kv, use_cache=True)
+                    draft_past_kv = d_out.past_key_values
+                    draft_last_logit = d_out.logits[0, -1, :]
+                    continue
             else:
                 # sa_only with no match — fall back to single cached autoregressive step
                 source = "autoregressive"
