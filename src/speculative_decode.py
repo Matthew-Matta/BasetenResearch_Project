@@ -40,14 +40,32 @@ Mode = Literal["autoregressive", "specdec", "sa_only", "hybrid_fixed", "hybrid_d
 # KV cache helpers
 # ---------------------------------------------------------------------------
 
-def _trim_kv(past_kv: tuple, seq_len: int) -> tuple:
-    """Trim KV cache to cover only the first *seq_len* positions."""
+def _trim_kv(past_kv, seq_len: int):
+    """Trim KV cache to cover only the first *seq_len* positions.
+
+    Handles both the legacy tuple-of-tuples format (transformers < 4.38)
+    and the DynamicCache object format (transformers >= 4.38).
+    """
+    try:
+        from transformers.cache_utils import DynamicCache
+        if isinstance(past_kv, DynamicCache):
+            new_cache = DynamicCache()
+            for k, v in zip(past_kv.key_cache, past_kv.value_cache):
+                new_cache.key_cache.append(k[:, :, :seq_len, :])
+                new_cache.value_cache.append(v[:, :, :seq_len, :])
+            return new_cache
+    except ImportError:
+        pass
+    # Legacy tuple format
     return tuple((k[:, :, :seq_len, :], v[:, :, :seq_len, :]) for k, v in past_kv)
 
 
-def _kv_len(past_kv: tuple) -> int:
+def _kv_len(past_kv) -> int:
     """Return the sequence length covered by a KV cache."""
-    return past_kv[0][0].shape[2]
+    try:
+        return past_kv.get_seq_length()          # DynamicCache (transformers >= 4.38)
+    except AttributeError:
+        return past_kv[0][0].shape[2]            # legacy tuple format
 
 
 # ---------------------------------------------------------------------------
