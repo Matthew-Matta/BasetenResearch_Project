@@ -124,6 +124,7 @@ def run_benchmark(
     max_new_tokens: int = 100,
     num_draft_tokens: int = 4,
     sa_threshold: int = 4,
+    temperature: float = 0.0,
     verbose: bool = False,
 ) -> list[GenerationMetrics]:
     """Run *method* on all *prompts* and return per-prompt metrics."""
@@ -138,6 +139,7 @@ def run_benchmark(
                 mode=method,
                 num_draft_tokens=num_draft_tokens,
                 sa_threshold=sa_threshold,
+                temperature=temperature,
             )
             results.append(metrics)
             if verbose:

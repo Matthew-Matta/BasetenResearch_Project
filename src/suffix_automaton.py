@@ -25,15 +25,21 @@ class SuffixAutomatonState:
     Each state represents an equivalence class of substrings (an end-set class).
 
     Attributes:
-        next:  Transition map token_id → state_id
-        link:  Suffix link (parent in suffix link tree)
-        len:   Length of the longest substring in this equivalence class
-        cnt:   Number of times this equivalence class occurs (set during topological sort)
+        next:     Transition map token_id → state_id
+        link:     Suffix link (parent in suffix link tree)
+        len:      Length of the longest substring in this equivalence class
+        cnt:      Number of times this equivalence class occurs (set during topological sort)
+        last_tok: Most recently indexed outgoing token from this state.  Used by
+                  query() to prefer the freshest continuation over min(next.keys()),
+                  which matters most at temperature=0 where token selection is
+                  deterministic: if context C was seen before and the model (greedily)
+                  generated token X, last_tok=X and SA will propose X → accepted.
     """
     next: dict[int, int] = field(default_factory=dict)
     link: int = -1
     len: int = 0
     cnt: int = 0
+    last_tok: int = -1
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +119,7 @@ class SuffixAutomaton:
         p = self._last
         while p != -1 and token not in self.states[p].next:
             self.states[p].next[token] = cur
+            self.states[p].last_tok = token
             p = self.states[p].link
         if p == -1:
             self.states[cur].link = 0
@@ -182,17 +189,21 @@ class SuffixAutomaton:
         if matched == 0 or not self.states[state].next:
             return [], matched
 
-        # Greedily collect draft tokens from forward edges
+        # Greedily collect draft tokens from forward edges.
+        # Prefer last_tok (most recently indexed outgoing transition) over min(keys).
+        # At temperature=0 the target model is deterministic: if context C was seen
+        # before and generated token X, then last_tok=X and SA will propose the
+        # correct token → high acceptance.  min(keys) picks an arbitrary token by
+        # vocab ID and is wrong most of the time when multiple transitions exist.
         draft_tokens: list[int] = []
         cur_state = state
         for _ in range(max_draft_len):
             if not self.states[cur_state].next:
                 break
-            # Pick the token with smallest ID for determinism
-            # (in practice the target model's logits choose the actual token)
-            next_tok = min(self.states[cur_state].next.keys())
+            s = self.states[cur_state]
+            next_tok = s.last_tok if s.last_tok != -1 and s.last_tok in s.next else min(s.next.keys())
             draft_tokens.append(next_tok)
-            cur_state = self.states[cur_state].next[next_tok]
+            cur_state = s.next[next_tok]
 
         return draft_tokens, matched
 

@@ -134,7 +134,7 @@ class HybridSpecDecoder:
         mode: Mode = "hybrid_dynamic",
         num_draft_tokens: int = 4,
         sa_threshold: int = 2,       # lowered from 4 → SA fires on 2-token matches
-        temperature: float = 1.0,
+        temperature: float = 0.0,
         top_p: float = 1.0,
     ) -> tuple[str, GenerationMetrics]:
         """Generate text using the specified decoding mode. Returns (text, metrics)."""
