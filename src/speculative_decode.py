@@ -37,13 +37,6 @@ Mode = Literal["autoregressive", "specdec", "sa_only", "hybrid_fixed", "hybrid_d
 
 
 # ---------------------------------------------------------------------------
-# KV cache helpers
-# ---------------------------------------------------------------------------
-
-# No KV trimming needed — we avoid slicing by saving pre-draft KV and re-running from there.
-
-
-# ---------------------------------------------------------------------------
 # Dynamic draft length controller
 # ---------------------------------------------------------------------------
 
@@ -206,7 +199,10 @@ class HybridSpecDecoder:
             # ==============================================================
             # Speculative modes — decide source and draft length
             # ==============================================================
-            context_tokens = generated_ids[0].tolist()
+            # Use a sliding window of recent tokens for SA context queries.
+            # Passing the full sequence would walk to the terminal state of the
+            # known prompt string, leaving no forward transitions → SA never fires.
+            context_tokens = generated_ids[0, -30:].tolist()
 
             if mode == "specdec":
                 draft_len = num_draft_tokens
@@ -267,6 +263,7 @@ class HybridSpecDecoder:
             # ==============================================================
             # Verify draft tokens — single cached target forward pass
             # ==============================================================
+            pre_draft_seq_len = generated_ids.shape[1]
             (
                 accepted_tokens,
                 bonus_token,
@@ -279,6 +276,7 @@ class HybridSpecDecoder:
                 source,
                 temperature,
                 draft_token_probs,  # pre-computed during generation — no second draft pass needed
+                pre_draft_seq_len,
             )
 
             proposed = len(draft_tokens)
@@ -382,13 +380,16 @@ class HybridSpecDecoder:
         source: str,
         temperature: float,
         draft_token_probs: list[float],  # pre-computed by _draft_model_tokens_cached
+        pre_draft_seq_len: int,
     ) -> tuple[list[int], int | None, tuple, torch.Tensor]:
         """
-        Single cached target forward pass over draft tokens.
+        Single cached target forward pass over draft tokens, followed by one bonus step.
 
-        Uses target_last_logit (the prediction from the previous accepted step)
-        to verify draft_tokens[0], and the output logits to verify draft_tokens[1..n-1].
-        draft_token_probs are pre-computed during generation — no second draft pass needed.
+        Uses target_last_logit to verify draft_tokens[0], and the output logits to verify
+        draft_tokens[1..n-1].  After acceptance is determined, the verification KV is
+        cropped to [prefix + accepted] then one target step is run for the bonus token.
+        This replaces the old _advance_target_kv (which reprocessed k+1 tokens from
+        pre_draft_kv) with a single 1-token pass, saving ~k target forward tokens per step.
 
         Returns (accepted_tokens, bonus_token, new_target_past_kv, new_target_last_logit).
         """
@@ -400,92 +401,79 @@ class HybridSpecDecoder:
 
         # Single forward pass — only processes n new tokens, not the full prefix
         out = self.target_model(draft_tensor, past_key_values=target_past_kv, use_cache=True)
-        # out.logits[0, i, :] = P(next | prefix + draft[0..i])
-        # → verifies draft[i+1]; bonus = out.logits[0, n-1, :]
-        # target_last_logit verifies draft[0]
+        verify_kv = out.past_key_values  # length = pre_draft_seq_len + n
 
         # Build verification logit matrix [n, vocab]
+        # verification_logits[i] = P(next | prefix + draft[0..i-1])
         if n == 1:
-            verification_logits = target_last_logit.unsqueeze(0)  # [1, vocab]
+            verification_logits = target_last_logit.unsqueeze(0)
         else:
             verification_logits = torch.cat(
                 [target_last_logit.unsqueeze(0), out.logits[0, :-1, :]], dim=0
-            )  # [n, vocab]
+            )
 
         bonus_logit = out.logits[0, -1, :]
 
+        # --- Determine accepted tokens and bonus ---
         if temperature == 0.0:
-            # Greedy verification
             accepted = []
+            bonus = None
             for i, tok in enumerate(draft_tokens):
                 best = verification_logits[i].argmax().item()
                 if tok == best:
                     accepted.append(tok)
                 else:
                     bonus = best
-                    new_kv, new_logit = self._advance_target_kv(
-                        target_past_kv, accepted, bonus
-                    )
-                    return accepted, bonus, new_kv, new_logit
-            bonus = bonus_logit.argmax().item()
-            new_kv, new_logit = self._advance_target_kv(
-                target_past_kv, accepted, bonus
-            )
-            return accepted, bonus, new_kv, new_logit
-
-        # Sampled: exact rejection sampling (Leviathan et al. 2023)
-        target_probs = F.softmax(verification_logits / max(temperature, 1e-8), dim=-1)  # [n, vocab]
-        bonus_probs = F.softmax(bonus_logit / max(temperature, 1e-8), dim=-1)
-
-        if source == "SA":
-            # p_draft(t_i) = 1 (deterministic), so accept_prob = min(1, p_target(t_i))
-            accept_probs = target_probs[torch.arange(n), draft_tokens]
+                    break
+            if bonus is None:
+                bonus = bonus_logit.argmax().item()
         else:
-            # Use pre-computed draft probabilities (saved during token generation)
-            draft_probs_tensor = torch.tensor(draft_token_probs[:n], device=self.device)
-            target_draft_probs = target_probs[torch.arange(n), draft_tokens]
-            accept_probs = torch.clamp(target_draft_probs / (draft_probs_tensor + 1e-10), max=1.0)
+            # Sampled: exact rejection sampling (Leviathan et al. 2023)
+            target_probs = F.softmax(verification_logits / max(temperature, 1e-8), dim=-1)
+            bonus_probs = F.softmax(bonus_logit / max(temperature, 1e-8), dim=-1)
 
-        accepted = []
-        for i, tok in enumerate(draft_tokens):
-            if torch.rand(1, device=self.device).item() < accept_probs[i].item():
-                accepted.append(tok)
+            if source == "SA":
+                # p_draft(t_i) = 1 (deterministic), so accept_prob = min(1, p_target(t_i))
+                accept_probs = target_probs[torch.arange(n), draft_tokens]
             else:
-                # Sample correction from residual distribution
-                if source != "SA":
-                    residual = F.relu(target_probs[i] - draft_probs_tensor[i] * target_probs[i])
-                    z = residual.sum()
-                    bonus = (torch.multinomial(residual / z, 1).item() if z > 1e-8
-                             else target_probs[i].argmax().item())
+                # Use pre-computed draft probabilities (saved during token generation)
+                draft_probs_tensor = torch.tensor(draft_token_probs[:n], device=self.device)
+                target_draft_probs = target_probs[torch.arange(n), draft_tokens]
+                accept_probs = torch.clamp(target_draft_probs / (draft_probs_tensor + 1e-10), max=1.0)
+
+            accepted = []
+            bonus = None
+            for i, tok in enumerate(draft_tokens):
+                if torch.rand(1, device=self.device).item() < accept_probs[i].item():
+                    accepted.append(tok)
                 else:
-                    bonus = torch.multinomial(target_probs[i], 1).item()
-                new_kv, new_logit = self._advance_target_kv(
-                    target_past_kv, accepted, bonus
-                )
-                return accepted, bonus, new_kv, new_logit
+                    if source != "SA":
+                        residual = F.relu(target_probs[i] - draft_probs_tensor[i] * target_probs[i])
+                        z = residual.sum()
+                        bonus = (torch.multinomial(residual / z, 1).item() if z > 1e-8
+                                 else target_probs[i].argmax().item())
+                    else:
+                        bonus = torch.multinomial(target_probs[i], 1).item()
+                    break
+            if bonus is None:
+                bonus = torch.multinomial(bonus_probs, 1).item()
 
-        # All accepted — sample bonus from target
-        bonus = torch.multinomial(bonus_probs, 1).item()
-        new_kv, new_logit = self._advance_target_kv(
-            target_past_kv, accepted, bonus
+        # --- Crop KV to accepted prefix, then run one target step for bonus ---
+        # This replaces _advance_target_kv (which re-ran k+1 tokens from pre_draft_kv)
+        # with a single 1-token pass, saving ~k target forward tokens per speculative step.
+        keep = pre_draft_seq_len + len(accepted)
+        try:
+            verify_kv.crop(keep)
+        except AttributeError:
+            # Tuple-format KV cache (older transformers): slice each layer manually
+            verify_kv = tuple(
+                (layer_k[:, :, :keep, :], layer_v[:, :, :keep, :])
+                for layer_k, layer_v in verify_kv
+            )
+        bonus_out = self.target_model(
+            torch.tensor([[bonus]], device=self.device),
+            past_key_values=verify_kv,
+            use_cache=True,
         )
-        return accepted, bonus, new_kv, new_logit
-
-    def _advance_target_kv(
-        self,
-        pre_draft_kv,
-        accepted_tokens: list[int],
-        bonus_token: int,
-    ):
-        """
-        Advance the target KV cache after speculative decoding.
-
-        Runs the target model on [accepted_tokens..., bonus_token] starting
-        from pre_draft_kv (the KV state BEFORE any draft tokens were fed in).
-        No KV slicing/trimming required — works with any cache format.
-        """
-        all_new = accepted_tokens + [bonus_token]
-        ids = torch.tensor([all_new], device=self.device)
-        out = self.target_model(ids, past_key_values=pre_draft_kv, use_cache=True)
-        return out.past_key_values, out.logits[0, -1, :]
+        return accepted, bonus, bonus_out.past_key_values, bonus_out.logits[0, -1, :]
 

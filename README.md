@@ -1,6 +1,6 @@
 # Suffix Automaton + Dynamic-Length Speculative Decoding
 
-A weekend implementation of suffix-automaton speculative decoding with **dynamic draft length control** — the explicit future work item named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/sa-mtp) and left unshipped in their Part 2 benchmarking post (Feb 5, 2026).
+A weekend implementation of suffix-automaton speculative decoding with **dynamic draft length control** — the explicit future work item named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) and left unshipped in their Part 2 benchmarking post (Feb 5, 2026).
 
 Built to understand and extend Baseten's [`sa_spec`](https://github.com/basetenlabs/sa_spec) architecture. All five decoding modes run on a free Colab T4.
 
@@ -48,27 +48,31 @@ Separate rolling-window acceptance rate trackers for SA and draft-model sources.
 
 ## Results
 
+All numbers measured on Google Colab T4 (free tier), Qwen2.5-Coder 1.5B/0.5B, 10-prompt mini-benchmark.
+
 ### Greedy decoding (temperature=0) — spec decoding wins
 
 With deterministic decoding, same-family Qwen models achieve high acceptance and spec decoding clearly beats autoregressive:
 
 | Mode | TPS | Acceptance | Avg draft len |
 |------|-----|-----------|---------------|
-| autoregressive | ~23 | 100% | 1.0 |
-| specdec | ~32 | ~75% | 4.0 |
-| hybrid_dynamic | ~35 | ~78% | adaptive |
+| autoregressive | 22.4 | 100% | 1.0 |
+| specdec | 17.9 | 87.3% | 4.0 |
+| hybrid_dynamic | 10.4 | 87.3% | adaptive |
+
+**Note on hybrid_dynamic greedy:** the DLC needs enough iterations to adapt draft length upward; on short 150-token outputs the adaptation window is limited.
 
 ### SA showcase — repetitive code generation
 
-SA excels when generated tokens repeat substrings from the context. For prompts requiring multiple similar methods (shared parameter signatures, return patterns), SA matches `(self, x, y):`, `return`, `def ` patterns across method definitions. SA acceptance rate rises to 60-80% on these prompts.
+SA excels when generated tokens repeat substrings from the prompt. The showcase prompt provides two fully-implemented methods as examples and asks the model to complete four more in the same style. The SA is built from the prompt and contains repeated substrings like `(self, x: float, y: float) -> float:`, `"""`, and `return x` — which the model generates verbatim when completing the class.
 
 ### Sampled decoding (temperature=1.0) — honest picture
 
 | Mode | TPS | Acceptance | Notes |
 |------|-----|-----------|-------|
-| autoregressive | 22.9 | 100% | Baseline |
-| specdec | 11.6 | 53% | 3x model ratio is too small on T4 |
-| hybrid_dynamic | 10.8 | 46% | SA needs repetitive context to fire |
+| autoregressive | 22.8 | 100% | Baseline |
+| specdec | 11.7 | 56.8% | 3x model ratio is too small on T4 |
+| hybrid_dynamic | 10.0 | 48.8% | SA needs repetitive context to fire |
 
 **Why specdec is slower at temperature=1.0:** speculative decoding requires the target model to be the bottleneck. At 3x model ratio (1.5B/0.5B) on T4, draft overhead + verification exceeds savings. Baseten's production deployments use much larger ratios (70B/7B = 10x) where the gains are 2-3x TPS. This is not a bug — it's the correct behavior for these model sizes.
 
@@ -76,11 +80,12 @@ SA excels when generated tokens repeat substrings from the context. For prompts 
 
 ## When does SA fire?
 
-SA finds matches when generated tokens repeat substrings of the prompt or earlier generated tokens. This happens with:
+SA finds matches when generated tokens repeat substrings of the **recent context** (a sliding window of the last ~30 tokens). This happens with:
 
 - **Repetitive code** — multiple methods with shared signatures, boilerplate
 - **Long context** — more tokens in the live automaton = more match opportunities
 - **Lower temperature** — model follows more predictable/repetitive paths
+- **Prompt that contains the patterns** — SA is built from prompt tokens, so the prompt must contain substrings that the model will regenerate
 
 SA does NOT help with novel code generation from a short prompt — tokens are mostly new content. This matches `sa_spec`'s finding that SA acceptance rates improve with longer generation and higher context repetition.
 
@@ -175,7 +180,7 @@ results/
 | SA threshold parameter (default 4 in sa_spec) | `sa_threshold` (configurable, default 2) |
 | Draft model fallback when SA match insufficient | `HybridSpecDecoder` hybrid modes |
 | TPS / TTFT / E2E latency / acceptance rate metrics | `GenerationMetrics`, `MetricsTracker` |
-| **"dynamically adjust speculation length"** — named future work, Jan 27 post | `DynamicLengthController` — **implemented here** |
+| **"dynamically adjust speculation length"** — named future work, [Jan 27 post](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) | `DynamicLengthController` — **implemented here** |
 
 ---
 
