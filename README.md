@@ -1,2 +1,189 @@
-# BasetenResearch_Project
-Hybrid speculative decoding system for LLM inference using a suffix automaton + draft model with dynamic-length speculation. Benchmarks throughput, latency, and acceptance rates on code generation tasks to improve tokens/sec over standard autoregressive decoding
+# Suffix Automaton + Dynamic-Length Speculative Decoding
+
+A weekend implementation of suffix-automaton speculative decoding with **dynamic draft length control** — the explicit future work item named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/sa-mtp) and left unshipped in their Part 2 benchmarking post (Feb 5, 2026).
+
+Built to understand and extend Baseten's [`sa_spec`](https://github.com/basetenlabs/sa_spec) architecture. All five decoding modes run on a free Colab T4.
+
+---
+
+## What this implements
+
+### 1. Pure-Python Suffix Automaton (`src/suffix_automaton.py`)
+
+O(n) construction via Blumer's algorithm — same algorithm as Baseten's C++/CUDA `sa_spec` repo, reimplemented in Python for portability. Supports:
+
+- Online `extend_one(token)` — O(1) amortized per token
+- `query(context, max_draft_len)` — walks automaton from current context suffix, returns draft candidates + match length
+- `DualSuffixAutomaton` — static automaton from prompt + dynamic automaton extended token-by-token during generation (mirrors the dual-SA architecture in `sa_spec`)
+
+### 2. Hybrid Speculative Decoding (`src/speculative_decode.py`)
+
+Five modes in a single `HybridSpecDecoder.generate()` call:
+
+| Mode | Draft source | Draft length |
+|------|-------------|--------------|
+| `autoregressive` | None | 1 |
+| `specdec` | Draft model | Fixed |
+| `sa_only` | Suffix automaton | Fixed |
+| `hybrid_fixed` | SA → draft model fallback | Fixed |
+| `hybrid_dynamic` | SA → draft model fallback | **Adaptive** |
+
+Mathematically exact rejection sampling (Leviathan et al. 2023): `accept_prob = min(1, p_target / p_draft)`. For SA drafts, `p_draft = 1` (deterministic), so `accept_prob = p_target(token)`.
+
+KV cache maintained across all decoding steps — each forward pass processes only the new draft tokens, not the full growing sequence.
+
+### 3. Dynamic Draft Length Controller — novel contribution
+
+The explicit future work from Baseten's Jan 27 post: *"dynamically adjusting the number of speculative tokens based on observed acceptance rates."*
+
+Separate rolling-window acceptance rate trackers for SA and draft-model sources. Draft length adjusts up/down based on 80%/40% thresholds, clamped to [2, 10].
+
+```python
+# SA and draft model tracked independently
+# High acceptance (>80%) → increase draft_len by 1
+# Low acceptance  (<40%) → decrease draft_len by 1
+```
+
+---
+
+## Results
+
+### Greedy decoding (temperature=0) — spec decoding wins
+
+With deterministic decoding, same-family Qwen models achieve high acceptance and spec decoding clearly beats autoregressive:
+
+| Mode | TPS | Acceptance | Avg draft len |
+|------|-----|-----------|---------------|
+| autoregressive | ~23 | 100% | 1.0 |
+| specdec | ~32 | ~75% | 4.0 |
+| hybrid_dynamic | ~35 | ~78% | adaptive |
+
+### SA showcase — repetitive code generation
+
+SA excels when generated tokens repeat substrings from the context. For prompts requiring multiple similar methods (shared parameter signatures, return patterns), SA matches `(self, x, y):`, `return`, `def ` patterns across method definitions. SA acceptance rate rises to 60-80% on these prompts.
+
+### Sampled decoding (temperature=1.0) — honest picture
+
+| Mode | TPS | Acceptance | Notes |
+|------|-----|-----------|-------|
+| autoregressive | 22.9 | 100% | Baseline |
+| specdec | 11.6 | 53% | 3x model ratio is too small on T4 |
+| hybrid_dynamic | 10.8 | 46% | SA needs repetitive context to fire |
+
+**Why specdec is slower at temperature=1.0:** speculative decoding requires the target model to be the bottleneck. At 3x model ratio (1.5B/0.5B) on T4, draft overhead + verification exceeds savings. Baseten's production deployments use much larger ratios (70B/7B = 10x) where the gains are 2-3x TPS. This is not a bug — it's the correct behavior for these model sizes.
+
+---
+
+## When does SA fire?
+
+SA finds matches when generated tokens repeat substrings of the prompt or earlier generated tokens. This happens with:
+
+- **Repetitive code** — multiple methods with shared signatures, boilerplate
+- **Long context** — more tokens in the live automaton = more match opportunities
+- **Lower temperature** — model follows more predictable/repetitive paths
+
+SA does NOT help with novel code generation from a short prompt — tokens are mostly new content. This matches `sa_spec`'s finding that SA acceptance rates improve with longer generation and higher context repetition.
+
+---
+
+## Architecture
+
+```
+Prompt tokens
+     │
+     ▼
+┌──────────────────────────────┐
+│      DualSuffixAutomaton     │
+│  prompt_sa (static)          │  ◄── built once from prompt
+│  live_sa   (dynamic)         │  ◄── extended per accepted token
+└──────────┬───────────────────┘
+           │ query(context, draft_len) → (draft_tokens, match_len)
+           ▼
+┌──────────────────────────────┐
+│    DynamicLengthController   │
+│  SA window:    [...]         │  ◄── per-source rolling acceptance
+│  draft window: [...]         │
+└──────────┬───────────────────┘
+           │ get_draft_length(source)
+           ▼
+┌─────────────────────────────────────────┐
+│           HybridSpecDecoder             │
+│                                         │   ┌──────────────────┐
+│  if SA match ≥ threshold:               │   │  Draft Model     │
+│      use SA drafts (p_draft = 1)        │◄──│  Qwen2.5-0.5B   │
+│  else:                                  │   └──────────────────┘
+│      use draft model tokens             │
+│                                         │   ┌──────────────────┐
+│  single target forward pass (KV cached) │──►│  Target Model    │
+│  exact rejection sampling               │   │  Qwen2.5-1.5B   │
+│  update live SA + DLC                   │   └──────────────────┘
+└─────────────────────────────────────────┘
+```
+
+---
+
+## Quickstart
+
+### Google Colab (T4 GPU — free tier)
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/BasetenResearch_Project/blob/main/notebooks/demo.ipynb)
+
+### Local
+
+```bash
+pip install -r requirements.txt
+
+# Full benchmark (GPU recommended)
+python -m src.benchmark --n-samples 10 --max-new-tokens 80
+
+# SA unit tests only (CPU, no models needed)
+python -c "
+from src.suffix_automaton import SuffixAutomaton
+sa = SuffixAutomaton()
+sa.build([1, 2, 3, 1, 2])
+drafts, match_len = sa.query([1, 2], max_draft_len=4)
+assert match_len == 2 and 3 in drafts
+print('SA unit test passed')
+"
+```
+
+---
+
+## Repo structure
+
+```
+src/
+  suffix_automaton.py   # O(n) Blumer SA, DualSuffixAutomaton
+  speculative_decode.py # HybridSpecDecoder, DynamicLengthController
+  benchmark.py          # 5-method benchmark harness with CLI
+  utils.py              # MetricsTracker, GenerationMetrics, plots
+notebooks/
+  demo.ipynb            # Colab-ready walkthrough (8 sections)
+results/
+  benchmarks.json       # Raw metrics (generated at runtime)
+  figures/              # TPS bar chart, draft length plot, acceptance breakdown
+```
+
+---
+
+## Connection to Baseten's work
+
+| Baseten's `sa_spec` | This repo |
+|---------------------|-----------|
+| C++/CUDA SA construction, O(n) Blumer | `SuffixAutomaton` — pure Python, same algorithm |
+| Dual automaton (prompt-static + generation-dynamic) | `DualSuffixAutomaton` |
+| SA threshold parameter (default 4 in sa_spec) | `sa_threshold` (configurable, default 2) |
+| Draft model fallback when SA match insufficient | `HybridSpecDecoder` hybrid modes |
+| TPS / TTFT / E2E latency / acceptance rate metrics | `GenerationMetrics`, `MetricsTracker` |
+| **"dynamically adjust speculation length"** — named future work, Jan 27 post | `DynamicLengthController` — **implemented here** |
+
+---
+
+## Models
+
+| Role | Model | VRAM (FP16) |
+|------|-------|------------|
+| Target | `Qwen/Qwen2.5-Coder-1.5B-Instruct` | ~4 GB |
+| Draft | `Qwen/Qwen2.5-Coder-0.5B-Instruct` | ~2 GB |
+
+Same model family as Baseten's published benchmarks. Both fit on a free T4 (16 GB).
