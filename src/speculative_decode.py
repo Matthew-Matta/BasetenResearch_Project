@@ -1,4 +1,3 @@
--- Active: 1750880455986@@127.0.0.1@5432
 """
 Hybrid Speculative Decoding Engine
 ===================================
@@ -502,9 +501,9 @@ class HybridSpecDecoder:
         # This replaces _advance_target_kv (which re-ran k+1 tokens from pre_draft_kv)
         # with a single 1-token pass, saving ~k target forward tokens per speculative step.
         keep = pre_draft_seq_len + len(accepted)
-        try:
+        if hasattr(verify_kv, "crop"):
             verify_kv.crop(keep)
-        except AttributeError:
+        else:
             # Tuple-format KV cache (older transformers): slice each layer manually
             verify_kv = tuple(
                 (layer_k[:, :, :keep, :], layer_v[:, :, :keep, :])
