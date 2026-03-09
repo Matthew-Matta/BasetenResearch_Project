@@ -230,18 +230,19 @@ class HybridSpecDecoder:
                 and len(sa_drafts) > 0
             )
 
-            # Save pre-draft draft model state before any drafting happens.
-            # Used for: (a) correct draft probability calculation, (b) KV resync after acceptance.
+            # Save pre-draft draft KV for resync after acceptance.
             draft_base_kv = draft_past_kv
-            draft_base_logit = draft_last_logit
+            draft_token_probs: list[float] = []  # populated during draft generation
 
             if use_sa:
                 source = "SA"
                 draft_tokens = sa_drafts[:draft_len]
             elif uses_draft and self.draft_model is not None:
                 source = "draft"
-                draft_tokens, draft_past_kv, draft_last_logit = self._draft_model_tokens_cached(
-                    draft_last_logit, draft_past_kv, draft_len, temperature
+                draft_tokens, draft_token_probs, draft_past_kv, draft_last_logit = (
+                    self._draft_model_tokens_cached(
+                        draft_last_logit, draft_past_kv, draft_len, temperature
+                    )
                 )
             else:
                 # sa_only with no match — fall back to single cached autoregressive step
@@ -277,8 +278,7 @@ class HybridSpecDecoder:
                 draft_tokens,
                 source,
                 temperature,
-                draft_base_kv,    # pre-draft KV (correct base for draft probability calculation)
-                draft_base_logit, # pre-draft logit (P(next | committed prefix))
+                draft_token_probs,  # pre-computed during generation — no second draft pass needed
             )
 
             proposed = len(draft_tokens)
@@ -342,18 +342,25 @@ class HybridSpecDecoder:
         draft_past_kv: tuple,
         num_tokens: int,
         temperature: float,
-    ) -> tuple[list[int], tuple, torch.Tensor]:
+    ) -> tuple[list[int], list[float], tuple, torch.Tensor]:
         """
         Generate num_tokens draft tokens using the cached draft model.
         Each step processes only the new token — O(1) per step instead of O(L).
-        Returns (tokens, updated_past_kv, updated_last_logit).
+
+        Also records the draft model's probability for each token so we don't
+        need a second draft pass during rejection sampling.
+
+        Returns (tokens, token_probs, updated_past_kv, updated_last_logit).
         """
         tokens = []
+        token_probs = []
         kv = draft_past_kv
         logit = draft_last_logit
 
         for _ in range(num_tokens):
+            probs = F.softmax(logit / max(temperature, 1e-8), dim=-1)
             tok = self._sample(logit, temperature).item()
+            token_probs.append(probs[tok].item())
             tokens.append(tok)
             if tok == self.target_tokenizer.eos_token_id:
                 break
@@ -365,23 +372,23 @@ class HybridSpecDecoder:
             kv = out.past_key_values
             logit = out.logits[0, -1, :]
 
-        return tokens, kv, logit
+        return tokens, token_probs, kv, logit
 
     def _verify_drafts_cached(
         self,
         target_last_logit: torch.Tensor,
-        target_past_kv: tuple,
+        target_past_kv,
         draft_tokens: list[int],
         source: str,
         temperature: float,
-        draft_past_kv: tuple | None,
-        draft_last_logit: torch.Tensor | None,
+        draft_token_probs: list[float],  # pre-computed by _draft_model_tokens_cached
     ) -> tuple[list[int], int | None, tuple, torch.Tensor]:
         """
         Single cached target forward pass over draft tokens.
 
         Uses target_last_logit (the prediction from the previous accepted step)
         to verify draft_tokens[0], and the output logits to verify draft_tokens[1..n-1].
+        draft_token_probs are pre-computed during generation — no second draft pass needed.
 
         Returns (accepted_tokens, bonus_token, new_target_past_kv, new_target_last_logit).
         """
@@ -434,13 +441,10 @@ class HybridSpecDecoder:
             # p_draft(t_i) = 1 (deterministic), so accept_prob = min(1, p_target(t_i))
             accept_probs = target_probs[torch.arange(n), draft_tokens]
         else:
-            # Get draft model probabilities using cached forward passes
-            draft_probs_list = self._draft_probs_cached(
-                draft_last_logit, draft_past_kv, draft_tokens, temperature
-            )
-            draft_token_probs = torch.tensor(draft_probs_list, device=self.device)
+            # Use pre-computed draft probabilities (saved during token generation)
+            draft_probs_tensor = torch.tensor(draft_token_probs[:n], device=self.device)
             target_draft_probs = target_probs[torch.arange(n), draft_tokens]
-            accept_probs = torch.clamp(target_draft_probs / (draft_token_probs + 1e-10), max=1.0)
+            accept_probs = torch.clamp(target_draft_probs / (draft_probs_tensor + 1e-10), max=1.0)
 
         accepted = []
         for i, tok in enumerate(draft_tokens):
@@ -449,7 +453,7 @@ class HybridSpecDecoder:
             else:
                 # Sample correction from residual distribution
                 if source != "SA":
-                    residual = F.relu(target_probs[i] - accept_probs[i] * target_probs[i])
+                    residual = F.relu(target_probs[i] - draft_probs_tensor[i] * target_probs[i])
                     z = residual.sum()
                     bonus = (torch.multinomial(residual / z, 1).item() if z > 1e-8
                              else target_probs[i].argmax().item())
@@ -485,30 +489,3 @@ class HybridSpecDecoder:
         out = self.target_model(ids, past_key_values=pre_draft_kv, use_cache=True)
         return out.past_key_values, out.logits[0, -1, :]
 
-    def _draft_probs_cached(
-        self,
-        draft_last_logit: torch.Tensor,
-        draft_past_kv: tuple,
-        draft_tokens: list[int],
-        temperature: float,
-    ) -> list[float]:
-        """
-        Compute draft model probability for each draft token using KV cache.
-        draft_last_logit[i] gives P(draft_tokens[i] | context before draft_tokens[i]).
-        """
-        probs = []
-        kv = draft_past_kv
-        logit = draft_last_logit
-
-        for tok in draft_tokens:
-            p = F.softmax(logit / max(temperature, 1e-8), dim=-1)
-            probs.append(p[tok].item())
-            out = self.draft_model(
-                torch.tensor([[tok]], device=self.device),
-                past_key_values=kv,
-                use_cache=True,
-            )
-            kv = out.past_key_values
-            logit = out.logits[0, -1, :]
-
-        return probs
