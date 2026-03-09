@@ -40,26 +40,7 @@ Mode = Literal["autoregressive", "specdec", "sa_only", "hybrid_fixed", "hybrid_d
 # KV cache helpers
 # ---------------------------------------------------------------------------
 
-def _to_legacy(past_kv) -> tuple:
-    """Convert DynamicCache → legacy tuple-of-tuples. No-op for legacy caches."""
-    try:
-        return past_kv.to_legacy_cache()
-    except AttributeError:
-        return past_kv
-
-
-def _trim_kv(past_kv, seq_len: int) -> tuple:
-    """Trim KV cache to the first *seq_len* positions, returning legacy tuple format."""
-    legacy = _to_legacy(past_kv)
-    return tuple((k[:, :, :seq_len, :], v[:, :, :seq_len, :]) for k, v in legacy)
-
-
-def _kv_len(past_kv) -> int:
-    """Return the sequence length covered by a KV cache."""
-    try:
-        return past_kv.get_seq_length()   # DynamicCache
-    except AttributeError:
-        return past_kv[0][0].shape[2]     # legacy tuple
+# No KV trimming needed — we avoid slicing by saving pre-draft KV and re-running from there.
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +230,11 @@ class HybridSpecDecoder:
                 and len(sa_drafts) > 0
             )
 
+            # Save pre-draft draft model state before any drafting happens.
+            # Used for: (a) correct draft probability calculation, (b) KV resync after acceptance.
+            draft_base_kv = draft_past_kv
+            draft_base_logit = draft_last_logit
+
             if use_sa:
                 source = "SA"
                 draft_tokens = sa_drafts[:draft_len]
@@ -291,8 +277,8 @@ class HybridSpecDecoder:
                 draft_tokens,
                 source,
                 temperature,
-                draft_past_kv,
-                draft_last_logit,
+                draft_base_kv,    # pre-draft KV (correct base for draft probability calculation)
+                draft_base_logit, # pre-draft logit (P(next | committed prefix))
             )
 
             proposed = len(draft_tokens)
@@ -314,13 +300,11 @@ class HybridSpecDecoder:
                     hit_eos = True
                     break
 
-            # Sync draft model KV cache to the newly accepted tokens.
-            # draft_past_kv after _draft_model_tokens_cached covers [prefix + all proposed drafts].
-            # We need it to cover [prefix + accepted_tokens + bonus].
-            # Strategy: trim back to pre-draft length, then extend with all_new tokens in one pass.
+            # Sync draft model KV cache to the committed tokens (accepted + bonus).
+            # Always done regardless of source so draft KV stays in sync for future iterations.
+            # draft_base_kv covers the committed prefix before this iteration's draft/SA tokens,
+            # so running draft on all_new from there gives the correct updated state.
             if uses_draft and self.draft_model is not None and all_new:
-                pre_draft_kv_len = _kv_len(target_past_kv) - len(all_new)
-                draft_base_kv = _trim_kv(draft_past_kv, pre_draft_kv_len)
                 sync_ids = torch.tensor([all_new], device=self.device)
                 d_out = self.draft_model(sync_ids, past_key_values=draft_base_kv, use_cache=True)
                 draft_past_kv = d_out.past_key_values
@@ -406,7 +390,6 @@ class HybridSpecDecoder:
             return [], None, target_past_kv, target_last_logit
 
         draft_tensor = torch.tensor([draft_tokens], device=self.device)
-        prefix_kv_len = _kv_len(target_past_kv)
 
         # Single forward pass — only processes n new tokens, not the full prefix
         out = self.target_model(draft_tensor, past_key_values=target_past_kv, use_cache=True)
@@ -434,13 +417,12 @@ class HybridSpecDecoder:
                 else:
                     bonus = best
                     new_kv, new_logit = self._advance_target_kv(
-                        target_past_kv, out.past_key_values, prefix_kv_len,
-                        len(accepted), bonus
+                        target_past_kv, accepted, bonus
                     )
                     return accepted, bonus, new_kv, new_logit
             bonus = bonus_logit.argmax().item()
             new_kv, new_logit = self._advance_target_kv(
-                target_past_kv, out.past_key_values, prefix_kv_len, n, bonus
+                target_past_kv, accepted, bonus
             )
             return accepted, bonus, new_kv, new_logit
 
@@ -474,37 +456,33 @@ class HybridSpecDecoder:
                 else:
                     bonus = torch.multinomial(target_probs[i], 1).item()
                 new_kv, new_logit = self._advance_target_kv(
-                    target_past_kv, out.past_key_values, prefix_kv_len, len(accepted), bonus
+                    target_past_kv, accepted, bonus
                 )
                 return accepted, bonus, new_kv, new_logit
 
         # All accepted — sample bonus from target
         bonus = torch.multinomial(bonus_probs, 1).item()
         new_kv, new_logit = self._advance_target_kv(
-            target_past_kv, out.past_key_values, prefix_kv_len, n, bonus
+            target_past_kv, accepted, bonus
         )
         return accepted, bonus, new_kv, new_logit
 
     def _advance_target_kv(
         self,
-        prefix_kv: tuple,
-        full_draft_kv: tuple,
-        prefix_kv_len: int,
-        k_accepted: int,
+        pre_draft_kv,
+        accepted_tokens: list[int],
         bonus_token: int,
-    ) -> tuple[tuple, torch.Tensor]:
+    ):
         """
-        After accepting k draft tokens + a bonus token, advance the target KV cache.
+        Advance the target KV cache after speculative decoding.
 
-        1. Trim full_draft_kv to prefix + k accepted positions.
-        2. Run one target step with bonus_token to get the new KV + last logit.
+        Runs the target model on [accepted_tokens..., bonus_token] starting
+        from pre_draft_kv (the KV state BEFORE any draft tokens were fed in).
+        No KV slicing/trimming required — works with any cache format.
         """
-        trimmed = _trim_kv(full_draft_kv, prefix_kv_len + k_accepted)
-        out = self.target_model(
-            torch.tensor([[bonus_token]], device=self.device),
-            past_key_values=trimmed,
-            use_cache=True,
-        )
+        all_new = accepted_tokens + [bonus_token]
+        ids = torch.tensor([all_new], device=self.device)
+        out = self.target_model(ids, past_key_values=pre_draft_kv, use_cache=True)
         return out.past_key_values, out.logits[0, -1, :]
 
     def _draft_probs_cached(
