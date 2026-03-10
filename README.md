@@ -2,7 +2,9 @@
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/BasetenResearch_Project/blob/main/notebooks/demo.ipynb)
 
-This implements **dynamic-length speculation** — the explicit future work named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) — on top of a full reimplementation of the dual-SA speculative decoding architecture from `sa_spec`. Run the Colab notebook to see SA acceptance rates and TPS comparisons on repetitive code generation (temp=1.0, T4 GPU).
+**2.16x throughput vs autoregressive** on repetitive code generation (49.2 vs 22.8 TPS, T4 GPU) using zero-cost suffix automaton drafts with suffix-link fallback.
+
+Implements **dynamic-length speculation** — the explicit future work named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) — on top of a full reimplementation of the dual-SA speculative decoding architecture from `sa_spec`, extended with per-source draft routing (SA vs draft model vs AR fallback).
 
 ---
 
@@ -45,39 +47,59 @@ The Section 9 scatter plot visualizes this per-step routing: SA (free), draft mo
 
 ---
 
-## Results
+## Results (T4 GPU, Colab free tier)
 
-*Run the Colab notebook end-to-end on a T4 GPU to reproduce. Numbers vary slightly between runs.*
+*All numbers from a single end-to-end notebook run. Re-run the Colab to reproduce — numbers vary slightly between runs.*
 
-### SA showcase — the headline result (temperature=1.0)
+### SA showcase — repetitive code prompt (temperature=1.0)
 
-SA excels when generated tokens repeat substrings from the prompt. The showcase prompt provides two fully-implemented methods and asks the model to complete four more in the same style. At temperature=1.0 the model stochastically revisits patterns like `(self, x: float, y: float) -> float:` and `return x` — exactly what the SA was built from. Frequency-weighted draft selection picks the most common continuation at each state, dramatically improving acceptance over arbitrary token ID selection.
+The showcase prompt provides two fully-implemented Calculator methods and asks the model to complete four more in the same style. At temperature=1.0 the model stochastically revisits patterns like `(self, x: float, y: float) -> float:` and `return x` — exactly the substrings the SA was built from.
 
-**Why SA drafts are free:** SA proposals are Python dict lookups — zero forward passes. On a memory-bandwidth-bound T4, verifying 4 tokens in a single KV-cached pass costs roughly the same as verifying 1 (the KV cache read dominates). Every accepted SA token is pure profit.
+| Mode | TPS | SA acceptance | Avg draft len | vs AR |
+|------|-----|---------------|---------------|-------|
+| `autoregressive` | 22.8 | — | 1.00 | 1.00x |
+| `sa_only` | **49.2** | **38.7%** | **6.28** | **2.16x** |
+| `hybrid_dynamic` | 16.7 | 23.9% | 4.39 | 0.73x |
 
-*Re-run Section 9 in the Colab notebook to reproduce.*
+**sa_only at 2.16x** is the headline: suffix-link fallback produces ~6 draft tokens per SA firing (up from ~1.3 before the fix), and every accepted token is pure profit since SA proposals are dict lookups — zero forward passes.
 
-### Greedy decoding (temperature=0)
+`hybrid_dynamic` is slower here because the DLC occasionally routes to the draft model, which is net negative at this 3x model ratio. On production hardware with a 10x+ ratio, the hybrid mode would benefit from both sources.
 
-At temperature=0, all five modes produce identical output (verifiable). The `last_tok` strategy ensures the SA proposes exactly the token the model chose last time it saw this context, achieving high acceptance on repeated patterns.
+### Greedy SA showcase — SA's best case (temperature=0)
 
-*Re-run Section 10 in the Colab notebook to reproduce.*
+At temperature=0, SA's `last_tok` prediction is deterministic: it records what the target model chose last time it saw this context. On repeated patterns, this matches the target's argmax perfectly.
+
+| Mode | TPS | Acceptance | Avg draft len | SA acceptance | vs AR |
+|------|-----|------------|---------------|---------------|-------|
+| `autoregressive` | 23.0 | 100.0% | 1.00 | — | 1.00x |
+| `specdec` | 12.1 | 55.9% | 3.94 | — | 0.53x |
+| `sa_only` | **46.6** | 44.1% | **5.85** | **39.5%** | **2.03x** |
+| `hybrid_dynamic` | **31.1** | 43.7% | 5.89 | 39.5% | **1.35x** |
+
+### Mini-benchmark — 10 generic code prompts (temperature=0)
+
+On diverse, non-repetitive prompts (glaiveai/code_edits_sample), SA fires less often. This is the honest baseline — SA helps on repetitive patterns, breaks even elsewhere.
+
+| Mode | TPS | Acceptance | SA acc | Draft acc | Avg draft len |
+|------|-----|------------|--------|-----------|---------------|
+| `autoregressive` | 22.7 | 100.0% | — | — | 1.00 |
+| `specdec` | 7.7 | 27.2% | — | 27.2% | 3.91 |
+| `sa_only` | 22.7 | 60.4% | 8.8% | — | 1.64 |
+| `hybrid_fixed` | 8.5 | 25.8% | 9.5% | 29.6% | 4.34 |
+| `hybrid_dynamic` | 12.0 | 53.7% | 8.6% | 24.7% | 1.96 |
+
+SA breaks even on generic prompts (no downside — zero-cost proposals), while the DLC in `hybrid_dynamic` correctly routes away from the draft model when it's not economical (12.0 vs 8.5 TPS for `hybrid_fixed`).
 
 ### Why draft-model specdec is slower at this model ratio
 
-This is the key insight for understanding speculative decoding economics:
+With a 3x ratio (1.5B/0.5B), the draft model costs ~0.4x per token — too expensive for its acceptance rate:
 
 ```
-With a 3x model ratio (1.5B target / 0.5B draft):
-  4 draft tokens at ~0.4x cost each + 1 verification = 2.6 target-equivalent passes
-  At ~10% acceptance (temp=1.0): ~1.1 tokens per cycle → 1.1/2.6 = 0.42x (slower than AR)
-
-With a production 10x ratio (e.g. 70B/7B):
-  4 draft tokens at ~0.1x cost each + 1 verification = 1.4 target-equivalent passes
-  At ~80% acceptance: ~3.4 tokens per cycle → 3.4/1.4 = 2.4x speedup
+3x ratio (this repo):   4 drafts × 0.4x + 1 verify = 2.6x cost → 1.1 tokens/cycle → 0.42x (slower)
+10x ratio (production):  4 drafts × 0.1x + 1 verify = 1.4x cost → 3.4 tokens/cycle → 2.4x speedup
 ```
 
-The SA sidesteps this entirely: SA drafts cost 0 forward passes, so even modest acceptance rates yield speedups. The DLC recognizes when draft-model speculation isn't economical (`rate × draft_len ≤ 1.0`) and falls back to autoregressive — avoiding the overhead trap automatically.
+SA sidesteps this entirely: 0 forward passes per draft token. The DLC recognizes when draft-model speculation isn't economical (`rate × draft_len ≤ 1.0`) and falls back to AR automatically — visible in the hybrid_dynamic source routing scatter plot (Section 9 of the notebook).
 
 ---
 
