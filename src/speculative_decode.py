@@ -172,7 +172,6 @@ class HybridSpecDecoder:
             draft_last_logit = d_out.logits[0, -1, :]
 
         tracker.record_ttft(time.perf_counter() - t_prefill)
-        first_token = False  # TTFT already recorded at prefill
 
         generated_ids = input_ids.clone()
         eos = self.target_tokenizer.eos_token_id

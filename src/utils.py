@@ -122,6 +122,7 @@ def plot_benchmark_results(results: dict[str, list[GenerationMetrics]], output_d
     bars = ax.bar(methods, mean_tps, yerr=std_tps, capsize=4, color=colors)
     ax.set_ylabel("Tokens per Second (TPS)")
     ax.set_title("Throughput Comparison Across Decoding Methods")
+    ax.set_xticks(range(len(methods)))
     ax.set_xticklabels(methods, rotation=15, ha="right")
     for bar, v in zip(bars, mean_tps):
         ax.text(bar.get_x() + bar.get_width() / 2, v + 0.5, f"{v:.1f}", ha="center", va="bottom", fontsize=9)

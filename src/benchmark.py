@@ -123,7 +123,7 @@ def run_benchmark(
     method: str,
     max_new_tokens: int = 100,
     num_draft_tokens: int = 4,
-    sa_threshold: int = 4,
+    sa_threshold: int = 2,
     temperature: float = 0.0,
     verbose: bool = False,
 ) -> list[GenerationMetrics]:
@@ -178,7 +178,7 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=50)
     parser.add_argument("--max-new-tokens", type=int, default=100)
     parser.add_argument("--num-draft-tokens", type=int, default=4)
-    parser.add_argument("--sa-threshold", type=int, default=4)
+    parser.add_argument("--sa-threshold", type=int, default=2)
     parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--device", default=None)
