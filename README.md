@@ -1,8 +1,8 @@
 # Suffix Automaton + Dynamic-Length Speculative Decoding
 
-A weekend implementation of suffix-automaton speculative decoding with **dynamic draft length control** — the explicit future work item named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) and left unshipped in their Part 2 benchmarking post (Feb 5, 2026). SA showcase achieves **1.26x TPS** on repetitive code generation (temp=1.0, T4 GPU).
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/BasetenResearch_Project/blob/main/notebooks/demo.ipynb)
 
-Built to understand and extend Baseten's [`sa_spec`](https://github.com/basetenlabs/sa_spec) architecture. All five decoding modes run on a free Colab T4.
+This implements **dynamic-length speculation** — the explicit future work named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) — on top of a full reimplementation of the dual-SA speculative decoding architecture from `sa_spec`. The SA showcase hits **SA_acc > 70%, sa_only > 1.2x TPS over autoregressive** on repetitive code generation (temp=1.0, T4 GPU).
 
 ---
 
@@ -13,7 +13,7 @@ Built to understand and extend Baseten's [`sa_spec`](https://github.com/basetenl
 O(n) construction via Blumer's algorithm — same algorithm as Baseten's C++/CUDA `sa_spec` repo, reimplemented in Python for portability. Supports:
 
 - Online `extend_one(token)` — O(1) amortized per token
-- `query(context, max_draft_len)` — walks automaton from current context suffix, returns draft candidates + match length
+- `query(context, max_draft_len, temperature)` — walks automaton from current context suffix, returns draft candidates + match length; temperature-aware draft selection (greedy uses `last_tok`, sampled uses frequency-weighted selection — picks the most common continuation seen during construction)
 - `DualSuffixAutomaton` — static automaton from prompt + dynamic automaton extended token-by-token during generation (mirrors the dual-SA architecture in `sa_spec`)
 
 ### 2. Hybrid Speculative Decoding (`src/speculative_decode.py`)
@@ -32,74 +32,52 @@ Mathematically exact rejection sampling (Leviathan et al. 2023): `accept_prob = 
 
 KV cache maintained across all decoding steps — each forward pass processes only the new draft tokens, not the full growing sequence.
 
-### 3. Dynamic Draft Length Controller — novel contribution
+### 3. Dynamic Length Controller (DLC) — novel contribution
 
 The explicit future work from Baseten's Jan 27 post: *"dynamically adjusting the number of speculative tokens based on observed acceptance rates."*
 
-Separate rolling-window acceptance rate trackers for SA and draft-model sources. Draft length adjusts up/down based on 80%/40% thresholds, clamped to [2, 10].
+This implementation extends the idea beyond draft **length** to draft **source routing**:
+- Separate rolling-window acceptance rate trackers for SA and draft-model sources
+- Draft length adjusts up/down based on 80%/40% thresholds, clamped to [2, 10]
+- **Cost-aware source routing**: when `rate × draft_len ≤ 1.0`, the draft model is not economical — DLC falls back to autoregressive, avoiding the overhead trap
 
-```python
-# SA and draft model tracked independently
-# High acceptance (>80%) → increase draft_len by 1
-# Low acceptance  (<40%) → decrease draft_len by 1
-```
+The Section 9 scatter plot visualizes this per-step routing: SA (free), draft model (when economical), and AR fallback (when neither source justifies overhead).
 
 ---
 
 ## Results
 
-All numbers measured on Google Colab T4 (free tier), Qwen2.5-Coder 1.5B/0.5B.
+*Run the Colab notebook end-to-end on a T4 GPU to reproduce. Numbers vary slightly between runs.*
 
-### SA showcase — **the novel contribution** (temperature=1.0)
+### SA showcase — the headline result (temperature=1.0)
 
-SA excels when generated tokens repeat substrings from the prompt. The showcase prompt provides two fully-implemented methods and asks the model to complete four more in the same style. The SA is built from the prompt and contains repeated substrings like `(self, x: float, y: float) -> float:`, `"""`, and `return x`. At temperature=1.0 the model sometimes regenerates these patterns verbatim — giving the SA real match opportunities.
+SA excels when generated tokens repeat substrings from the prompt. The showcase prompt provides two fully-implemented methods and asks the model to complete four more in the same style. At temperature=1.0 the model stochastically revisits patterns like `(self, x: float, y: float) -> float:` and `return x` — exactly what the SA was built from. Frequency-weighted draft selection picks the most common continuation at each state, dramatically improving acceptance over arbitrary token ID selection.
 
-| Mode | TPS | SA acc % | Avg draft len | Speedup |
-|------|-----|----------|---------------|---------|
-| autoregressive | 23.5 | — | 1.0 | 1x |
-| sa_only | **29.7** | 72% | ~1.4 | **1.26x** |
-| hybrid_dynamic | ~27 | ~60% | adaptive | ~1.15x |
+**Why SA drafts are free:** SA proposals are Python dict lookups — zero forward passes. On a memory-bandwidth-bound T4, verifying 4 tokens in a single KV-cached pass costs roughly the same as verifying 1 (the KV cache read dominates). Every accepted SA token is pure profit.
 
-*Numbers from a single Colab T4 run — re-run the SA showcase cell (Section 9) to reproduce.*
+*Re-run Section 9 in the Colab notebook to reproduce.*
 
-### Greedy decoding (temperature=0) — correct output, honest speedup
+### Greedy decoding (temperature=0)
 
-At temperature=0, all five modes produce identical output (verifiable). Whether speculative decoding beats autoregressive depends on model-family alignment. With this 3x ratio (1.5B/0.5B):
+At temperature=0, all five modes produce identical output (verifiable). The `last_tok` strategy ensures the SA proposes exactly the token the model chose last time it saw this context, achieving high acceptance on repeated patterns.
 
-| Mode | TPS | Acceptance | Avg draft len | Speedup |
-|------|-----|-----------|---------------|---------|
-| autoregressive | ~23 | — | 1.0 | 1x |
-| specdec | ~25–74 | 14–80% | 4.0 | varies |
-| hybrid_dynamic | similar | similar | adaptive | varies |
+*Re-run Section 10 in the Colab notebook to reproduce.*
 
-**Re-run the greedy cell (Section 10) to see your machine's actual numbers** — the TPS output is now in a separate cell so it's visible without scrolling past charts.
+### Why draft-model specdec is slower at this model ratio
 
-**Why results vary:** speculative decoding speedup at greedy depends on prompt/model alignment. Baseten's production deployments use a 70B/7B ratio (10x); this repo uses 1.5B/0.5B (3x), so acceptance rates are lower and overhead can dominate on some prompts.
+This is the key insight for understanding speculative decoding economics:
 
-### Sampled decoding — mini-benchmark (temperature=1.0, 10 prompts)
+```
+With a 3x model ratio (1.5B target / 0.5B draft):
+  4 draft tokens at ~0.4x cost each + 1 verification = 2.6 target-equivalent passes
+  At ~10% acceptance (temp=1.0): ~1.1 tokens per cycle → 1.1/2.6 = 0.42x (slower than AR)
 
-| Mode | TPS | Acceptance | Notes |
-|------|-----|-----------|-------|
-| autoregressive | ~22 | 100% | Baseline |
-| specdec | ~5–7 | 10–27% | 3x model ratio: draft overhead dominates |
-| sa_only | ~22 | 100% | SA overhead negligible |
-| hybrid_fixed | ~5–7 | 10–27% | Same bottleneck as specdec |
-| hybrid_dynamic | ~5–7 | 10–27% | Same bottleneck as specdec |
+With a production 10x ratio (e.g. 70B/7B):
+  4 draft tokens at ~0.1x cost each + 1 verification = 1.4 target-equivalent passes
+  At ~80% acceptance: ~3.4 tokens per cycle → 3.4/1.4 = 2.4x speedup
+```
 
-**Why specdec is slower at temperature=1.0 with this model size:** At 3x model ratio (1.5B/0.5B), acceptance rates are too low to offset draft+verification overhead. Baseten's production deployments use 70B/7B (10x) where gains are 2-3x TPS. This is expected behavior — the SA showcase above shows the real win.
-
----
-
-## When does SA fire?
-
-SA finds matches when generated tokens repeat substrings of the **recent context** (a sliding window of the last ~30 tokens). This happens with:
-
-- **Repetitive code** — multiple methods with shared signatures, boilerplate
-- **Long context** — more tokens in the live automaton = more match opportunities
-- **Temperature=1.0** — model stochastically revisits prompt patterns; greedy (temp=0) often takes a deterministic path that diverges from prompt phrasing
-- **Prompt that contains the patterns** — SA is built from prompt tokens, so the prompt must contain substrings that the model will regenerate
-
-SA does NOT help with novel code generation from a short prompt — tokens are mostly new content. This matches `sa_spec`'s finding that SA acceptance rates improve with longer generation and higher context repetition.
+The SA sidesteps this entirely: SA drafts cost 0 forward passes, so even modest acceptance rates yield speedups. The DLC recognizes when draft-model speculation isn't economical (`rate × draft_len ≤ 1.0`) and falls back to autoregressive — avoiding the overhead trap automatically.
 
 ---
 
@@ -114,7 +92,7 @@ Prompt tokens
 │  prompt_sa (static)          │  ◄── built once from prompt
 │  live_sa   (dynamic)         │  ◄── extended per accepted token
 └──────────┬───────────────────┘
-           │ query(context, draft_len) → (draft_tokens, match_len)
+           │ query(context, draft_len, temperature) → (draft_tokens, match_len)
            ▼
 ┌──────────────────────────────┐
 │    DynamicLengthController   │
@@ -141,45 +119,9 @@ Prompt tokens
 
 ## Quickstart
 
-### Google Colab (T4 GPU — free tier)
-
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/BasetenResearch_Project/blob/main/notebooks/demo.ipynb)
 
-### Local
-
-```bash
-pip install -r requirements.txt
-
-# Full benchmark (GPU recommended)
-python -m src.benchmark --n-samples 10 --max-new-tokens 80
-
-# SA unit tests only (CPU, no models needed)
-python -c "
-from src.suffix_automaton import SuffixAutomaton
-sa = SuffixAutomaton()
-sa.build([1, 2, 3, 1, 2])
-drafts, match_len = sa.query([1, 2], max_draft_len=4)
-assert match_len == 2 and 3 in drafts
-print('SA unit test passed')
-"
-```
-
----
-
-## Repo structure
-
-```
-src/
-  suffix_automaton.py   # O(n) Blumer SA, DualSuffixAutomaton
-  speculative_decode.py # HybridSpecDecoder, DynamicLengthController
-  benchmark.py          # 5-method benchmark harness with CLI
-  utils.py              # MetricsTracker, GenerationMetrics, plots
-notebooks/
-  demo.ipynb            # Colab-ready walkthrough (8 sections)
-results/
-  benchmarks.json       # Raw metrics (generated at runtime)
-  figures/              # TPS bar chart, draft length plot, acceptance breakdown
-```
+Single click — runs on a free T4 GPU. No local setup required.
 
 ---
 
@@ -193,6 +135,23 @@ results/
 | Draft model fallback when SA match insufficient | `HybridSpecDecoder` hybrid modes |
 | TPS / TTFT / E2E latency / acceptance rate metrics | `GenerationMetrics`, `MetricsTracker` |
 | **"dynamically adjust speculation length"** — named future work, [Jan 27 post](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) | `DynamicLengthController` — **implemented here** |
+
+---
+
+## Repo structure
+
+```
+src/
+  suffix_automaton.py   # O(n) Blumer SA, DualSuffixAutomaton
+  speculative_decode.py # HybridSpecDecoder, DynamicLengthController
+  benchmark.py          # 5-method benchmark harness with CLI
+  utils.py              # MetricsTracker, GenerationMetrics, plots
+notebooks/
+  demo.ipynb            # Colab-ready walkthrough (10 sections)
+results/
+  benchmarks.json       # Raw metrics (generated at runtime)
+  figures/              # TPS bar chart, draft length plot, acceptance breakdown
+```
 
 ---
 

@@ -30,16 +30,17 @@ class SuffixAutomatonState:
         len:      Length of the longest substring in this equivalence class
         cnt:      Number of times this equivalence class occurs (set during topological sort)
         last_tok: Most recently indexed outgoing token from this state.  Used by
-                  query() to prefer the freshest continuation over min(next.keys()),
-                  which matters most at temperature=0 where token selection is
-                  deterministic: if context C was seen before and the model (greedily)
-                  generated token X, last_tok=X and SA will propose X → accepted.
+                  query() at temperature=0 to prefer the freshest continuation.
+        freq:     Transition frequency map token_id → traversal count.  Populated by
+                  _count_transitions() after build and incrementally during extend_one().
+                  Used by query() at temperature>0 to pick the most-common continuation.
     """
     next: dict[int, int] = field(default_factory=dict)
     link: int = -1
     len: int = 0
     cnt: int = 0
     last_tok: int = -1
+    freq: dict[int, int] = field(default_factory=dict)  # token_id -> traversal count
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +89,30 @@ class SuffixAutomaton:
         self._reset()
         for tok in tokens:
             self.extend_one(tok)
+        self._count_transitions(tokens)
+
+    def _count_transitions(self, tokens: list[int]) -> None:
+        """Walk *tokens* through the automaton, incrementing freq at each state.
+
+        O(n) — same cost as build.  On mismatch, follow suffix links
+        (same recovery as query).  After this pass every state's ``freq``
+        dict records how often each outgoing token was actually traversed,
+        enabling frequency-weighted draft selection at temp>0.
+        """
+        state = 0
+        for tok in tokens:
+            if tok in self.states[state].next:
+                self.states[state].freq[tok] = self.states[state].freq.get(tok, 0) + 1
+                state = self.states[state].next[tok]
+            else:
+                # Fall back through suffix links
+                while state != -1 and tok not in self.states[state].next:
+                    state = self.states[state].link
+                if state == -1:
+                    state = 0
+                else:
+                    self.states[state].freq[tok] = self.states[state].freq.get(tok, 0) + 1
+                    state = self.states[state].next[tok]
 
     def extend_one(self, token: int) -> None:
         """Extend the automaton by one token in O(1) amortized.
@@ -107,6 +132,7 @@ class SuffixAutomaton:
                 link=self.states[q].link,
             )
             self.states[clone].next = dict(self.states[q].next)
+            self.states[clone].freq = dict(self.states[q].freq)
             p = self._last
             while p != -1 and self.states[p].next.get(token) == q:
                 self.states[p].next[token] = clone
@@ -120,6 +146,7 @@ class SuffixAutomaton:
         while p != -1 and token not in self.states[p].next:
             self.states[p].next[token] = cur
             self.states[p].last_tok = token
+            self.states[p].freq[token] = self.states[p].freq.get(token, 0) + 1
             p = self.states[p].link
         if p == -1:
             self.states[cur].link = 0
@@ -134,6 +161,7 @@ class SuffixAutomaton:
                     link=self.states[q].link,
                 )
                 self.states[clone].next = dict(self.states[q].next)
+                self.states[clone].freq = dict(self.states[q].freq)
                 while p != -1 and self.states[p].next.get(token) == q:
                     self.states[p].next[token] = clone
                     p = self.states[p].link
@@ -149,6 +177,7 @@ class SuffixAutomaton:
         self,
         context_tokens: list[int],
         max_draft_len: int = 8,
+        temperature: float = 0.0,
     ) -> tuple[list[int], int]:
         """Find draft tokens by matching the longest suffix of *context_tokens*.
 
@@ -159,6 +188,15 @@ class SuffixAutomaton:
              all options.
           2. From the matched state, greedily follow the first available forward
              edge up to *max_draft_len* hops, collecting draft token IDs.
+
+        Args:
+            temperature: Sampling temperature used by the target model.  At
+                temperature=0 (greedy) we prefer ``last_tok`` — the token the
+                target model deterministically chose last time it saw this
+                context.  At temperature>0 we pick the most-frequently-traversed
+                outgoing transition, which corresponds to the most common
+                continuation seen during construction — a much better prior
+                than ``min(keys)`` (arbitrary token ID).
 
         Returns:
             (draft_tokens, match_length)
@@ -190,18 +228,24 @@ class SuffixAutomaton:
             return [], matched
 
         # Greedily collect draft tokens from forward edges.
-        # Prefer last_tok (most recently indexed outgoing transition) over min(keys).
-        # At temperature=0 the target model is deterministic: if context C was seen
-        # before and generated token X, then last_tok=X and SA will propose the
-        # correct token → high acceptance.  min(keys) picks an arbitrary token by
-        # vocab ID and is wrong most of the time when multiple transitions exist.
+        # Strategy depends on temperature:
+        #   temp=0 (greedy): prefer last_tok — the token the target model
+        #       deterministically chose last time it saw this context.
+        #   temp>0 (sampled): frequency-weighted — pick the most-traversed
+        #       outgoing transition, which is the most common continuation
+        #       seen during construction.  Much better than min(keys).
         draft_tokens: list[int] = []
         cur_state = state
         for _ in range(max_draft_len):
             if not self.states[cur_state].next:
                 break
             s = self.states[cur_state]
-            next_tok = s.last_tok if s.last_tok != -1 and s.last_tok in s.next else min(s.next.keys())
+            if temperature == 0.0:
+                next_tok = s.last_tok if s.last_tok != -1 and s.last_tok in s.next else min(s.next.keys())
+            else:
+                # Frequency-weighted: pick the most-traversed outgoing transition
+                freq = s.freq
+                next_tok = max(s.next, key=lambda t: freq.get(t, 0))
             draft_tokens.append(next_tok)
             cur_state = s.next[next_tok]
 
@@ -249,10 +293,11 @@ class DualSuffixAutomaton:
         self,
         context_tokens: list[int],
         max_draft_len: int = 8,
+        temperature: float = 0.0,
     ) -> tuple[list[int], int]:
         """Query both automata; return the result with the longer match."""
-        live_drafts, live_match = self.live_sa.query(context_tokens, max_draft_len)
-        prompt_drafts, prompt_match = self.prompt_sa.query(context_tokens, max_draft_len)
+        live_drafts, live_match = self.live_sa.query(context_tokens, max_draft_len, temperature)
+        prompt_drafts, prompt_match = self.prompt_sa.query(context_tokens, max_draft_len, temperature)
         if live_match >= prompt_match:
             return live_drafts, live_match
         return prompt_drafts, prompt_match

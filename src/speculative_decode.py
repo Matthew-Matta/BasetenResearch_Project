@@ -122,6 +122,17 @@ class HybridSpecDecoder:
         if self.draft_model is not None:
             self.draft_model.eval()
 
+    def warmup(self, prompt: str = "Hello", n_warmup: int = 3) -> None:
+        """Run a few throwaway forward passes to warm up CUDA kernels and caches."""
+        input_ids = self.target_tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+        with torch.no_grad():
+            for _ in range(n_warmup):
+                self.target_model(input_ids, use_cache=False)
+                if self.draft_model is not None:
+                    self.draft_model(input_ids, use_cache=False)
+        if self.device == "cuda":
+            torch.cuda.synchronize()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -139,6 +150,8 @@ class HybridSpecDecoder:
     ) -> tuple[str, GenerationMetrics]:
         """Generate text using the specified decoding mode. Returns (text, metrics)."""
         tracker = MetricsTracker()
+        if self.device == "cuda":
+            torch.cuda.synchronize()
         t_start = time.perf_counter()
 
         # Tokenize prompt
@@ -217,11 +230,11 @@ class HybridSpecDecoder:
                 sa_drafts, sa_match = [], 0
             elif mode == "sa_only":
                 draft_len = num_draft_tokens
-                sa_drafts, sa_match = dsa.query(context_tokens, max_draft_len=draft_len)
+                sa_drafts, sa_match = dsa.query(context_tokens, max_draft_len=draft_len, temperature=temperature)
             else:  # hybrid_fixed / hybrid_dynamic
                 sa_dl = dlc.get_draft_length("SA") if mode == "hybrid_dynamic" else num_draft_tokens
                 draft_dl = dlc.get_draft_length("draft") if mode == "hybrid_dynamic" else num_draft_tokens
-                sa_drafts, sa_match = dsa.query(context_tokens, max_draft_len=sa_dl)
+                sa_drafts, sa_match = dsa.query(context_tokens, max_draft_len=sa_dl, temperature=temperature)
                 draft_len = sa_dl if sa_match >= sa_threshold else draft_dl
 
             draft_len = min(draft_len, remaining)
@@ -349,6 +362,8 @@ class HybridSpecDecoder:
             if hit_eos:
                 break
 
+        if self.device == "cuda":
+            torch.cuda.synchronize()
         total_time = time.perf_counter() - t_start
         total_tokens = generated_ids.shape[1] - prompt_len
         metrics = tracker.finalize(total_tokens=total_tokens, total_time=total_time)

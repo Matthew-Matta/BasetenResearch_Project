@@ -130,6 +130,9 @@ def run_benchmark(
     """Run *method* on all *prompts* and return per-prompt metrics."""
     from tqdm import tqdm
 
+    # Warmup CUDA kernels before timing (idempotent if already warmed)
+    decoder.warmup()
+
     results = []
     for i, prompt in enumerate(tqdm(prompts, desc=method, leave=False)):
         try:
