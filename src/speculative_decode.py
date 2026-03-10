@@ -145,6 +145,7 @@ class HybridSpecDecoder:
         mode: Mode = "hybrid_dynamic",
         num_draft_tokens: int = 4,
         sa_threshold: int = 2,       # lowered from 4 → SA fires on 2-token matches
+        sa_max_draft_len: int = 10,  # SA drafts are free (dict lookups) — propose more tokens
         temperature: float = 0.0,
         top_p: float = 1.0,
     ) -> tuple[str, GenerationMetrics]:
@@ -229,10 +230,10 @@ class HybridSpecDecoder:
                 draft_len = num_draft_tokens
                 sa_drafts, sa_match = [], 0
             elif mode == "sa_only":
-                draft_len = num_draft_tokens
-                sa_drafts, sa_match = dsa.query(context_tokens, max_draft_len=draft_len, temperature=temperature)
+                draft_len = sa_max_draft_len
+                sa_drafts, sa_match = dsa.query(context_tokens, max_draft_len=sa_max_draft_len, temperature=temperature)
             else:  # hybrid_fixed / hybrid_dynamic
-                sa_dl = dlc.get_draft_length("SA") if mode == "hybrid_dynamic" else num_draft_tokens
+                sa_dl = max(dlc.get_draft_length("SA"), sa_max_draft_len) if mode == "hybrid_dynamic" else sa_max_draft_len
                 draft_dl = dlc.get_draft_length("draft") if mode == "hybrid_dynamic" else num_draft_tokens
                 sa_drafts, sa_match = dsa.query(context_tokens, max_draft_len=sa_dl, temperature=temperature)
                 draft_len = sa_dl if sa_match >= sa_threshold else draft_dl

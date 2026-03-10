@@ -124,6 +124,7 @@ def run_benchmark(
     max_new_tokens: int = 100,
     num_draft_tokens: int = 4,
     sa_threshold: int = 2,
+    sa_max_draft_len: int = 10,
     temperature: float = 0.0,
     verbose: bool = False,
 ) -> list[GenerationMetrics]:
@@ -142,6 +143,7 @@ def run_benchmark(
                 mode=method,
                 num_draft_tokens=num_draft_tokens,
                 sa_threshold=sa_threshold,
+                sa_max_draft_len=sa_max_draft_len,
                 temperature=temperature,
             )
             results.append(metrics)

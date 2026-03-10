@@ -251,8 +251,15 @@ class SuffixAutomaton:
         draft_tokens: list[int] = []
         cur_state = state
         for _ in range(max_draft_len):
+            # Follow suffix links if current state is a dead-end
             if not self.states[cur_state].next:
-                break
+                fallback = self.states[cur_state].link
+                while fallback > 0 and not self.states[fallback].next:
+                    fallback = self.states[fallback].link
+                if fallback <= 0 or not self.states[fallback].next:
+                    break
+                cur_state = fallback
+
             s = self.states[cur_state]
             if temperature == 0.0:
                 next_tok = s.last_tok if s.last_tok != -1 and s.last_tok in s.next else min(s.next.keys())
