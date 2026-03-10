@@ -4,7 +4,7 @@
 
 **2.16x throughput vs autoregressive** on repetitive code generation (49.2 vs 22.8 TPS, T4 GPU) using zero-cost suffix automaton drafts with suffix-link fallback.
 
-Implements **dynamic-length speculation** — the explicit future work named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) — on top of a full reimplementation of the dual-SA speculative decoding architecture from `sa_spec`, extended with per-source draft routing (SA vs draft model vs AR fallback).
+Implements **dynamic-length speculation**, future work named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) — on top of a full reimplementation of the dual-SA speculative decoding architecture from `sa_spec`, extended with per-source draft routing (SA vs draft model vs AR fallback).
 
 ---
 
@@ -36,8 +36,6 @@ KV cache maintained across all decoding steps — each forward pass processes on
 
 ### 3. Dynamic Length Controller (DLC) — novel contribution
 
-The explicit future work from Baseten's Jan 27 post: *"dynamically adjusting the number of speculative tokens based on observed acceptance rates."*
-
 This implementation extends the idea beyond draft **length** to draft **source routing**:
 - Separate rolling-window acceptance rate trackers for SA and draft-model sources
 - Draft length adjusts up/down based on 80%/40% thresholds, clamped to [2, 10]
@@ -53,7 +51,7 @@ The Section 9 scatter plot visualizes this per-step routing: SA (free), draft mo
 
 ### SA showcase — repetitive code prompt (temperature=1.0)
 
-The showcase prompt provides two fully-implemented Calculator methods and asks the model to complete four more in the same style. At temperature=1.0 the model stochastically revisits patterns like `(self, x: float, y: float) -> float:` and `return x` — exactly the substrings the SA was built from.
+The showcase prompt provides two fully-implemented Calculator methods and asks the model to complete four more in the same style. At temperature=1.0 the model stochastically revisits patterns like `(self, x: float, y: float) -> float:` and `return x`. The substrings the SA was built from.
 
 | Mode | TPS | SA acceptance | Avg draft len | vs AR |
 |------|-----|---------------|---------------|-------|
@@ -78,7 +76,7 @@ At temperature=0, SA's `last_tok` prediction is deterministic: it records what t
 
 ### Mini-benchmark — 10 generic code prompts (temperature=0)
 
-On diverse, non-repetitive prompts (glaiveai/code_edits_sample), SA fires less often. This is the honest baseline — SA helps on repetitive patterns, breaks even elsewhere.
+On diverse, non-repetitive prompts (glaiveai/code_edits_sample), SA fires less often. This is the baseline — SA helps on repetitive patterns, breaks even elsewhere.
 
 | Mode | TPS | Acceptance | SA acc | Draft acc | Avg draft len |
 |------|-----|------------|--------|-----------|---------------|
