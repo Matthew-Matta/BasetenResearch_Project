@@ -2,7 +2,7 @@
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/BasetenResearch_Project/blob/main/notebooks/demo.ipynb)
 
-This implements **dynamic-length speculation** — the explicit future work named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) — on top of a full reimplementation of the dual-SA speculative decoding architecture from `sa_spec`. The SA showcase hits **SA_acc > 70%, sa_only > 1.2x TPS over autoregressive** on repetitive code generation (temp=1.0, T4 GPU).
+This implements **dynamic-length speculation** — the explicit future work named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) — on top of a full reimplementation of the dual-SA speculative decoding architecture from `sa_spec`. Run the Colab notebook to see SA acceptance rates and TPS comparisons on repetitive code generation (temp=1.0, T4 GPU).
 
 ---
 

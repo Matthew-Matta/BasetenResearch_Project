@@ -223,7 +223,7 @@ class HybridSpecDecoder:
             # Use a sliding window of recent tokens for SA context queries.
             # Passing the full sequence would walk to the terminal state of the
             # known prompt string, leaving no forward transitions → SA never fires.
-            context_tokens = generated_ids[0, -30:].tolist()
+            context_tokens = generated_ids[0, -64:].tolist()
 
             if mode == "specdec":
                 draft_len = num_draft_tokens

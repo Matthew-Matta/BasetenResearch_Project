@@ -124,9 +124,13 @@ class SuffixAutomaton:
         if token in self.states[self._last].next:
             q = self.states[self._last].next[token]
             if self.states[q].len == self.states[self._last].len + 1:
+                self.states[self._last].freq[token] = self.states[self._last].freq.get(token, 0) + 1
+                self.states[self._last].last_tok = token
                 self._last = q
                 return
             # Clone q
+            self.states[self._last].freq[token] = self.states[self._last].freq.get(token, 0) + 1
+            self.states[self._last].last_tok = token
             clone = self._new_state(
                 length=self.states[self._last].len + 1,
                 link=self.states[q].link,
@@ -224,8 +228,18 @@ class SuffixAutomaton:
                     state = self.states[state].next[tok]
                     matched = self.states[state].len
 
-        if matched == 0 or not self.states[state].next:
-            return [], matched
+        if matched == 0:
+            return [], 0
+
+        # Fall back through suffix links to find a state with forward transitions
+        while matched > 0 and not self.states[state].next:
+            state = self.states[state].link
+            if state <= 0:
+                return [], 0
+            matched = self.states[state].len
+
+        if not self.states[state].next:
+            return [], 0
 
         # Greedily collect draft tokens from forward edges.
         # Strategy depends on temperature:
