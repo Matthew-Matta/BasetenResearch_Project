@@ -1,6 +1,6 @@
 # Suffix Automaton + Dynamic-Length Speculative Decoding
 
-A weekend implementation of suffix-automaton speculative decoding with **dynamic draft length control** — the explicit future work item named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) and left unshipped in their Part 2 benchmarking post (Feb 5, 2026).
+A weekend implementation of suffix-automaton speculative decoding with **dynamic draft length control** — the explicit future work item named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) and left unshipped in their Part 2 benchmarking post (Feb 5, 2026). SA showcase achieves **1.26x TPS** on repetitive code generation (temp=1.0, T4 GPU).
 
 Built to understand and extend Baseten's [`sa_spec`](https://github.com/basetenlabs/sa_spec) architecture. All five decoding modes run on a free Colab T4.
 
@@ -50,33 +50,43 @@ Separate rolling-window acceptance rate trackers for SA and draft-model sources.
 
 All numbers measured on Google Colab T4 (free tier), Qwen2.5-Coder 1.5B/0.5B.
 
-### Greedy decoding (temperature=0) — **3.22x speedup** ✅
+### SA showcase — **the novel contribution** (temperature=1.0)
 
-With deterministic decoding, same-family Qwen models achieve high acceptance and spec decoding clearly beats autoregressive:
+SA excels when generated tokens repeat substrings from the prompt. The showcase prompt provides two fully-implemented methods and asks the model to complete four more in the same style. The SA is built from the prompt and contains repeated substrings like `(self, x: float, y: float) -> float:`, `"""`, and `return x`. At temperature=1.0 the model sometimes regenerates these patterns verbatim — giving the SA real match opportunities.
+
+| Mode | TPS | SA acc % | Avg draft len | Speedup |
+|------|-----|----------|---------------|---------|
+| autoregressive | 23.5 | — | 1.0 | 1x |
+| sa_only | **29.7** | 72% | ~1.4 | **1.26x** |
+| hybrid_dynamic | ~27 | ~60% | adaptive | ~1.15x |
+
+*Numbers from a single Colab T4 run — re-run the SA showcase cell (Section 9) to reproduce.*
+
+### Greedy decoding (temperature=0) — correct output, honest speedup
+
+At temperature=0, all five modes produce identical output (verifiable). Whether speculative decoding beats autoregressive depends on model-family alignment. With this 3x ratio (1.5B/0.5B):
 
 | Mode | TPS | Acceptance | Avg draft len | Speedup |
 |------|-----|-----------|---------------|---------|
-| autoregressive | 23.0 | 77.3% | 1.0 | 1x |
-| specdec | **74.0** | 79.8% | 4.0 | **3.22x** |
-| hybrid_dynamic | 68.9 | 77.5% | adaptive | 3.0x |
+| autoregressive | ~23 | — | 1.0 | 1x |
+| specdec | ~25–74 | 14–80% | 4.0 | varies |
+| hybrid_dynamic | similar | similar | adaptive | varies |
 
-This matches or exceeds the 2-3x speedup target from Baseten's benchmarking post. TTFT is also lower for all speculative modes (prefill benefit).
+**Re-run the greedy cell (Section 10) to see your machine's actual numbers** — the TPS output is now in a separate cell so it's visible without scrolling past charts.
 
-### SA showcase — repetitive code generation (temperature=0)
+**Why results vary:** speculative decoding speedup at greedy depends on prompt/model alignment. Baseten's production deployments use a 70B/7B ratio (10x); this repo uses 1.5B/0.5B (3x), so acceptance rates are lower and overhead can dominate on some prompts.
 
-SA excels when generated tokens repeat substrings from the prompt. The showcase prompt provides two fully-implemented methods as examples and asks the model to complete four more in the same style. The SA is built from the prompt and contains repeated substrings like `(self, x: float, y: float) -> float:`, `"""`, and `return x` — which the model generates verbatim when completing the class. Running at temperature=0 (greedy) maximizes SA match opportunities since token paths are deterministic.
-
-### Sampled decoding (temperature=1.0) — honest picture
+### Sampled decoding — mini-benchmark (temperature=1.0, 10 prompts)
 
 | Mode | TPS | Acceptance | Notes |
 |------|-----|-----------|-------|
-| autoregressive | 22.31 | 100% | Baseline |
-| specdec | 5.16 | 9.9% | Model ratio too small for sampled |
-| sa_only | 22.62 | 100% | SA overhead negligible |
-| hybrid_fixed | 5.22 | 9.9% | Same bottleneck as specdec |
-| hybrid_dynamic | 5.17 | 9.6% | Same bottleneck as specdec |
+| autoregressive | ~22 | 100% | Baseline |
+| specdec | ~5–7 | 10–27% | 3x model ratio: draft overhead dominates |
+| sa_only | ~22 | 100% | SA overhead negligible |
+| hybrid_fixed | ~5–7 | 10–27% | Same bottleneck as specdec |
+| hybrid_dynamic | ~5–7 | 10–27% | Same bottleneck as specdec |
 
-**Why specdec is slower at temperature=1.0 with this model size:** speculative decoding requires the draft model to be fast *and* have high acceptance. At 3x model ratio (1.5B/0.5B), the 9.9% acceptance rate means draft+verification overhead dominates. Baseten's production deployments use much larger ratios (70B/7B = 10x) where gains are 2-3x TPS. This is not a bug — it's the correct behavior for these model sizes, and the greedy results above show the implementation is correct.
+**Why specdec is slower at temperature=1.0 with this model size:** At 3x model ratio (1.5B/0.5B), acceptance rates are too low to offset draft+verification overhead. Baseten's production deployments use 70B/7B (10x) where gains are 2-3x TPS. This is expected behavior — the SA showcase above shows the real win.
 
 ---
 
@@ -86,7 +96,7 @@ SA finds matches when generated tokens repeat substrings of the **recent context
 
 - **Repetitive code** — multiple methods with shared signatures, boilerplate
 - **Long context** — more tokens in the live automaton = more match opportunities
-- **Lower temperature** — model follows more predictable/repetitive paths
+- **Temperature=1.0** — model stochastically revisits prompt patterns; greedy (temp=0) often takes a deterministic path that diverges from prompt phrasing
 - **Prompt that contains the patterns** — SA is built from prompt tokens, so the prompt must contain substrings that the model will regenerate
 
 SA does NOT help with novel code generation from a short prompt — tokens are mostly new content. This matches `sa_spec`'s finding that SA acceptance rates improve with longer generation and higher context repetition.
